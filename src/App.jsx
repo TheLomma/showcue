@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect } from "react";
 
-const VERSION = "2.0.0";
+const VERSION = "2.1.0";
 
 const uid = () => Math.random().toString(36).slice(2, 9);
 
@@ -102,7 +102,18 @@ const THEME_CSS = `
 const btn =
   "rounded-xl bg-zinc-800 py-3 text-sm font-medium hover:bg-zinc-700 focus:outline-none focus-visible:ring-2 focus-visible:ring-amber-400";
 
+const gestureOf = (k) => {
+  const i = k.indexOf("#");
+  return i < 0 ? "tap" : k.slice(i + 1);
+};
+
+const baseOf = (k) => {
+  const i = k.indexOf("#");
+  return i < 0 ? k : k.slice(0, i);
+};
+
 const keyLabel = (k) => {
+  if (k.includes("#")) return `${keyLabel(baseOf(k))} (${gestureOf(k) === "double" ? "Doppeltipp" : "Halten"})`;
   const names = {
     " ": "Leertaste",
     AudioVolumeUp: "Lautstärke +",
@@ -201,10 +212,14 @@ export default function App() {
   const keymapRef = useRef(keymap);
   const learningRef = useRef(learning);
   const runRef = useRef(null);
+  const timersRef = useRef([]);
+  const playingRef = useRef(null);
+  const tapRef = useRef({});
   cuesRef.current = cues;
   activeRef.current = activeId || pausedId;
   keymapRef.current = keymap;
   learningRef.current = learning;
+  playingRef.current = activeId;
 
   const nextIdx = cues.findIndex((c) => c.id === lastId);
   const nextCue = cues[nextIdx + 1] ?? (nextIdx === -1 ? cues[0] : undefined);
@@ -265,6 +280,7 @@ export default function App() {
     };
     audio.onended = () => {
       setActiveId((prev) => (prev === cue.id ? null : prev));
+      if (!audio.loop) followNext(cue.id);
     };
     playersRef.current[cue.id] = { audio, gain: null, source: null, token: 0 };
   };
@@ -356,9 +372,9 @@ export default function App() {
       setStatus(`Kein YouTube-Link bei „${cue.title}“.`);
       return;
     }
-    if (activeId && activeId !== cue.id) {
-      const out = cuesRef.current.find((c) => c.id === activeId);
-      fadeOut(activeId, out ? out.fadeOut : 1);
+    if (playingRef.current && playingRef.current !== cue.id) {
+      const out = cuesRef.current.find((c) => c.id === playingRef.current);
+      fadeOut(playingRef.current, out ? out.fadeOut : 1);
     }
     let yt;
     try {
@@ -392,6 +408,7 @@ export default function App() {
                 ytRef.current[cue.id].playVideo();
               } else {
                 setActiveId((prev) => (prev === cue.id ? null : prev));
+                followNext(cue.id);
               }
             },
           },
@@ -431,9 +448,9 @@ export default function App() {
       return;
     }
     const now = ctx.currentTime;
-    if (activeId && activeId !== cue.id) {
-      const out = cuesRef.current.find((c) => c.id === activeId);
-      fadeOut(activeId, out ? out.fadeOut : 1);
+    if (playingRef.current && playingRef.current !== cue.id) {
+      const out = cuesRef.current.find((c) => c.id === playingRef.current);
+      fadeOut(playingRef.current, out ? out.fadeOut : 1);
     }
     p.token++;
     if (!resume) p.audio.currentTime = 0;
@@ -446,6 +463,42 @@ export default function App() {
     setPausedId(null);
     setLastId(cue.id);
     setStatus(`Läuft: ${cue.title}`);
+  };
+
+  const clearTimers = () => {
+    timersRef.current.forEach((t) => clearTimeout(t));
+    timersRef.current = [];
+  };
+
+  const startWithWait = (cue) => {
+    const w = Number(cue.preWait) || 0;
+    if (w <= 0) return playCue(cue);
+    setStatus(`Startet in ${w} s: ${cue.title}`);
+    const t = setTimeout(() => {
+      const fresh = cuesRef.current.find((c) => c.id === cue.id);
+      if (fresh) playCue(fresh);
+    }, w * 1000);
+    timersRef.current.push(t);
+  };
+
+  const startCueWithChain = (cue) => {
+    startWithWait(cue);
+    (cue.chain || []).forEach((link) => {
+      const t = setTimeout(() => {
+        const fresh = cuesRef.current.find((c) => c.id === link.id);
+        if (fresh) startWithWait(fresh);
+      }, (Number(link.delay) || 0) * 1000);
+      timersRef.current.push(t);
+    });
+  };
+
+  const followNext = (id) => {
+    const list = cuesRef.current;
+    const i = list.findIndex((c) => c.id === id);
+    const c = list[i];
+    if (!c || !c.autoFollow) return;
+    const next = list[i + 1];
+    if (next) startWithWait(next);
   };
 
   const togglePause = () => {
@@ -463,6 +516,7 @@ export default function App() {
   };
 
   const stopMusic = (dur = 1.5) => {
+    clearTimers();
     if (activeId) fadeOut(activeId, dur);
     setActiveId(null);
     setPausedId(null);
@@ -470,6 +524,7 @@ export default function App() {
   };
 
   const emergency = () => {
+    clearTimers();
     const now = ctxRef.current ? ctxRef.current.currentTime : 0;
     Object.keys(playersRef.current).forEach((id) => {
       const p = playersRef.current[id];
@@ -510,7 +565,7 @@ export default function App() {
       setStatus("Keine weiteren Cues.");
       return;
     }
-    playCue(selCue);
+    startCueWithChain(selCue);
   };
 
   const selectBy = (dir) => {
@@ -689,37 +744,85 @@ export default function App() {
   runRef.current = run;
 
   useEffect(() => {
-    const onKey = (e) => {
+    const finish = (a) => runRef.current(a);
+    const tapped = (base) => {
+      const km = keymapRef.current;
+      if (km[base + "#double"]) {
+        const pending = tapRef.current[base];
+        if (pending) {
+          clearTimeout(pending);
+          delete tapRef.current[base];
+          finish(km[base + "#double"]);
+          return;
+        }
+        tapRef.current[base] = setTimeout(() => {
+          delete tapRef.current[base];
+          if (km[base]) finish(km[base]);
+        }, 400);
+        return;
+      }
+      if (km[base]) finish(km[base]);
+    };
+    const holdTimers = {};
+    const holdFired = {};
+    const onDown = (e) => {
       const tag = e.target.tagName;
       if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || e.metaKey || e.ctrlKey || e.altKey) return;
       const key = keyOf(e);
       if (learningRef.current) {
         e.preventDefault();
+        if (e.repeat) return;
         if (key === "Escape") {
           setLearning(null);
           setStatus("Belegung abgebrochen.");
           return;
         }
-        const action = learningRef.current;
+        const [action, gesture] = learningRef.current.split("|");
+        const full = gesture === "tap" ? key : `${key}#${gesture}`;
         setKeymap((prev) => {
           const n = {};
           Object.keys(prev).forEach((k) => {
-            if (prev[k] !== action && k !== key) n[k] = prev[k];
+            if (k === full) return;
+            if (prev[k] === action && gestureOf(k) === gesture) return;
+            n[k] = prev[k];
           });
-          n[key] = action;
+          n[full] = action;
           return n;
         });
         setLearning(null);
-        setStatus(`${keyLabel(key)} belegt.`);
+        setStatus(`${keyLabel(full)} belegt.`);
         return;
       }
-      const a = keymapRef.current[key];
-      if (!a) return;
+      const km = keymapRef.current;
+      if (!km[key] && !km[key + "#double"] && !km[key + "#hold"]) return;
       e.preventDefault();
-      runRef.current(a);
+      if (e.repeat) return;
+      if (km[key + "#hold"]) {
+        holdFired[key] = false;
+        holdTimers[key] = setTimeout(() => {
+          holdFired[key] = true;
+          finish(keymapRef.current[key + "#hold"]);
+        }, 600);
+        return;
+      }
+      tapped(key);
     };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
+    const onUp = (e) => {
+      const key = keyOf(e);
+      if (!keymapRef.current[key + "#hold"]) return;
+      clearTimeout(holdTimers[key]);
+      if (holdFired[key]) {
+        holdFired[key] = false;
+        return;
+      }
+      tapped(key);
+    };
+    window.addEventListener("keydown", onDown);
+    window.addEventListener("keyup", onUp);
+    return () => {
+      window.removeEventListener("keydown", onDown);
+      window.removeEventListener("keyup", onUp);
+    };
   }, []);
 
   useEffect(() => {
@@ -796,6 +899,9 @@ export default function App() {
     volume: settings.defaultVol,
     loop: false,
     marks: [],
+    preWait: 0,
+    autoFollow: false,
+    chain: [],
     ...over,
   });
 
@@ -925,6 +1031,11 @@ export default function App() {
         volume: c.volume,
         loop: !!c.loop,
         marks: c.marks || [],
+        preWait: c.preWait || 0,
+        autoFollow: !!c.autoFollow,
+        chain: (c.chain || [])
+          .map((l) => ({ index: cues.findIndex((x) => x.id === l.id), delay: l.delay || 0 }))
+          .filter((l) => l.index >= 0),
       })),
     };
     const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
@@ -953,8 +1064,15 @@ export default function App() {
           volume: c.volume ?? 0.9,
           loop: !!c.loop,
           marks: Array.isArray(c.marks) ? c.marks : [],
+          preWait: Number(c.preWait) || 0,
+          autoFollow: !!c.autoFollow,
         })
       );
+      d.cues.forEach((c, i) => {
+        imported[i].chain = (c.chain || [])
+          .filter((l) => imported[l.index])
+          .map((l) => ({ id: imported[l.index].id, delay: Number(l.delay) || 0 }));
+      });
       setCues((prev) => [...prev, ...imported]);
       if (d.settings) setSettings((s) => ({ ...s, ...d.settings }));
       if (d.keymap) setKeymap(d.keymap);
@@ -964,13 +1082,15 @@ export default function App() {
     }
   };
 
-  const startLearn = (actionId) => {
-    setLearning(learning === actionId ? null : actionId);
-    setStatus(
-      learning === actionId
-        ? "Belegung abgebrochen."
-        : "Jetzt die Taste auf der Fernbedienung drücken (Esc bricht ab)."
-    );
+  const startLearn = (actionId, gesture = "tap") => {
+    const v = `${actionId}|${gesture}`;
+    if (learning === v) {
+      setLearning(null);
+      setStatus("Belegung abgebrochen.");
+      return;
+    }
+    setLearning(v);
+    setStatus("Jetzt die Taste drücken (Esc bricht ab).");
   };
 
   const timerPct = timer.total ? ((timer.total - timer.left) / timer.total) * 100 : 0;
@@ -1018,7 +1138,7 @@ export default function App() {
                   onClick={(e) => {
                     e.stopPropagation();
                     if (isActive) togglePause();
-                    else playCue(c);
+                    else startCueWithChain(c);
                   }}
                   aria-label={isActive ? `${c.title} pausieren` : `${c.title} abspielen`}
                   className="h-9 w-9 shrink-0 rounded-full bg-zinc-800 text-sm hover:bg-zinc-700 focus:outline-none focus-visible:ring-2 focus-visible:ring-amber-400"
@@ -1042,6 +1162,8 @@ export default function App() {
                     {c.duration ? fmt(c.duration) : "--:--"}
                     {" · ab "}
                     {fmt(starts[i])}
+                    {c.preWait > 0 && <span className="ml-2">⏱ {c.preWait} s</span>}
+                    {c.autoFollow && <span className="ml-2">→ Auto</span>}
                     {c.loop && <span className="ml-2 text-amber-400">↻ Schleife</span>}
                     {isSel && !isActive && <span className="ml-2 text-amber-400">ausgewählt</span>}
                     {isActive && <span className="ml-2 text-amber-400">läuft</span>}
@@ -1094,6 +1216,76 @@ export default function App() {
                       Schleifenmodus
                     </label>
                   </div>
+                  <div className="grid grid-cols-2 gap-2 text-xs text-zinc-300">
+                    <label>
+                      Vorlaufzeit (s)
+                      <input
+                        type="number"
+                        min="0"
+                        step="0.5"
+                        value={c.preWait || 0}
+                        onChange={(e) => updateCue(c.id, { preWait: Math.max(0, parseFloat(e.target.value) || 0) })}
+                        className="mt-1 w-full rounded-lg bg-zinc-950/60 px-2 py-1 text-xs"
+                      />
+                    </label>
+                    <label className="flex items-end gap-2 pb-1">
+                      <input type="checkbox" checked={!!c.autoFollow} onChange={(e) => updateCue(c.id, { autoFollow: e.target.checked })} className="accent-amber-400" />
+                      Auto-Follow (nach dem Ende nächster Cue)
+                    </label>
+                  </div>
+                  <div className="text-xs">
+                    <span className="text-zinc-500">Zusätzlich starten (Chain):</span>
+                    <div className="mt-1 flex flex-wrap items-center gap-2">
+                      {(c.chain || []).map((l, li) => {
+                        const t = cues.find((x) => x.id === l.id);
+                        return (
+                          <span key={li} className="flex items-center gap-1 rounded-lg bg-zinc-800 px-2 py-1 text-zinc-200">
+                            {t ? t.title : "(gelöscht)"} +
+                            <input
+                              type="number"
+                              min="0"
+                              step="0.5"
+                              value={l.delay || 0}
+                              aria-label="Verzögerung in Sekunden"
+                              onChange={(e) =>
+                                updateCue(c.id, {
+                                  chain: (c.chain || []).map((x, k) =>
+                                    k === li ? { ...x, delay: Math.max(0, parseFloat(e.target.value) || 0) } : x
+                                  ),
+                                })
+                              }
+                              className="w-14 rounded bg-zinc-950/60 px-1 text-xs"
+                            />
+                            s
+                            <button
+                              onClick={() => updateCue(c.id, { chain: (c.chain || []).filter((_, k) => k !== li) })}
+                              aria-label="Verknüpfung entfernen"
+                              className="text-zinc-500 hover:text-red-400"
+                            >
+                              ✕
+                            </button>
+                          </span>
+                        );
+                      })}
+                      <select
+                        value=""
+                        onChange={(e) => {
+                          if (!e.target.value) return;
+                          updateCue(c.id, { chain: [...(c.chain || []), { id: e.target.value, delay: 0 }] });
+                        }}
+                        className="rounded-lg bg-zinc-800 px-2 py-1 text-xs"
+                      >
+                        <option value="">+ Cue hinzufügen</option>
+                        {cues
+                          .filter((x) => x.id !== c.id)
+                          .map((x) => (
+                            <option key={x.id} value={x.id}>
+                              {x.title}
+                            </option>
+                          ))}
+                      </select>
+                    </div>
+                  </div>
                   <textarea
                     value={c.note}
                     onChange={(e) => updateCue(c.id, { note: e.target.value })}
@@ -1128,10 +1320,7 @@ export default function App() {
                     {!(c.marks || []).length && <span className="text-zinc-600">keine</span>}
                   </div>
                   {c.type === "file" && c.url && (
-                    <button
-                      onClick={() => togglePreview(c)}
-                      className="rounded-lg bg-zinc-800 px-3 py-1.5 text-xs hover:bg-zinc-700"
-                    >
+                    <button onClick={() => togglePreview(c)} className="rounded-lg bg-zinc-800 px-3 py-1.5 text-xs hover:bg-zinc-700">
                       {previewId === c.id ? "Vorhören stoppen" : "Vorhören (ohne Publikum)"}
                     </button>
                   )}
@@ -1327,23 +1516,27 @@ export default function App() {
 
   const renderRemoteMapping = () => (
     <div className="divide-y divide-zinc-800">
-      {ACTIONS.map((a) => {
-        const key = Object.keys(keymap).find((k) => keymap[k] === a.id);
-        return (
-          <div key={a.id} className="flex items-center justify-between gap-2 py-2 text-xs">
-            <span className="text-zinc-300">{a.label}</span>
-            <span className="flex items-center gap-2">
-              <span className="min-w-[6rem] rounded bg-zinc-800 px-2 py-1 text-center text-zinc-300">{key ? keyLabel(key) : "frei"}</span>
-              <button
-                onClick={() => startLearn(a.id)}
-                className={`rounded-lg px-3 py-1.5 ${learning === a.id ? "bg-amber-400 font-bold text-zinc-950" : "bg-zinc-800 hover:bg-zinc-700"}`}
-              >
-                {learning === a.id ? "Taste drücken…" : "Belegen"}
-              </button>
-            </span>
+      <p className="pb-2 text-[10px] uppercase tracking-widest text-zinc-500">Tippen · Doppeltipp · Halten</p>
+      {ACTIONS.map((a) => (
+        <div key={a.id} className="py-2 text-xs">
+          <div className="text-zinc-300">{a.label}</div>
+          <div className="mt-1 flex flex-wrap gap-2">
+            {[["tap", "Tippen"], ["double", "Doppeltipp"], ["hold", "Halten"]].map(([g, gl]) => {
+              const key = Object.keys(keymap).find((k) => keymap[k] === a.id && gestureOf(k) === g);
+              const v = `${a.id}|${g}`;
+              return (
+                <button
+                  key={g}
+                  onClick={() => startLearn(a.id, g)}
+                  className={`rounded-lg px-2 py-1.5 ${learning === v ? "bg-amber-400 font-bold text-zinc-950" : "bg-zinc-800 hover:bg-zinc-700"}`}
+                >
+                  {gl}: {learning === v ? "Taste drücken…" : key ? keyLabel(key) : "frei"}
+                </button>
+              );
+            })}
           </div>
-        );
-      })}
+        </div>
+      ))}
       <button onClick={() => setKeymap(DEFAULT_KEYMAP)} className="mt-3 text-xs text-zinc-500 hover:text-zinc-300">
         Standardbelegung wiederherstellen
       </button>

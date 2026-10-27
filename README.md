@@ -1,4 +1,4 @@
-# Showcue 2.0.0
+# Showcue 2.1.0
 
 Musik- und Effektsteuerung fuer Zaubershows. Laeuft im Browser. Lokale Musik bleibt auf dem Geraet.
 
@@ -25,7 +25,7 @@ Die Befehle stehen in package.json: dev (Entwicklungsserver), build (Produktions
 
     git init
     git add .
-    git commit -m "Showcue 2.0.0"
+    git commit -m "Showcue 2.1.0"
     git branch -M main
     git remote add origin https://github.com/DEIN-NAME/showcue.git
     git push -u origin main
